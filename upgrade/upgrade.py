@@ -1521,6 +1521,10 @@ class Updater:
                     )
 
     def start_update(self, update_file_list: list, install_active: bool=False) -> bool:
+        if not update_file_list:
+            LOGGER.warning("No update packages provided; skipping update")
+            return False
+
         ui = self.ui
         t = self.t
 
@@ -1990,7 +1994,7 @@ exit 0
                         self.updater.start_append(data_update_url, data_md5)
                     elif not append_active and update_active:
                         self.updater.start_update(update_file_list, install_active=True)
-                    else:
+                    elif append_active and update_active:
                         if self.updater.start_update(update_file_list, install_active=False):
                             self.updater.start_append(data_update_url, data_md5)
 
