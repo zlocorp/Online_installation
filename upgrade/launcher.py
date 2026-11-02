@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import glob
+import select
 import hashlib
 import shutil
 import socket
@@ -292,10 +293,14 @@ class InputHandler:
             return fallback
         raise RuntimeError("No ANBERNIC input device found")
 
-    def poll(self) -> None:
+    def poll(self, stop_event=None) -> None:
+        if stop_event is not None and stop_event.is_set():
+            return
         if os.name == "nt":
             event = sdl2.SDL_Event()
             while sdl2.SDL_PollEvent(ctypes.byref(event)):
+                if stop_event is not None and stop_event.is_set():
+                    return
                 if event.type == sdl2.SDL_KEYDOWN:
                     sym = event.key.keysym.sym
                     if sym in self.key_map:
@@ -310,33 +315,42 @@ class InputHandler:
             self.code_name = ""
             self.value = 0
         else:
+            fd = None
             try:
-                with open(self.device_path, "rb") as f:
-                    while True:
-                        event = f.read(24)
-                        if not event:
-                            break
-                        (tv_sec, tv_usec, etype, kcode, kvalue) = struct.unpack(
-                            "llHHI", event
-                        )
-                        if kvalue != 0:
-                            if kvalue != 1:
-                                kvalue = -1
-                            else:
-                                kvalue = 1
-                            self.code_name = self.cfg.keymap.get(kcode, str(kcode))
-                            self.value = kvalue
-                            LOGGER.debug(
-                                "Key pressed: %s (code: %s, value: %s)",
-                                self.code_name,
-                                kcode,
-                                kvalue,
-                            )
+                fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
+                pending = b""
+                while stop_event is None or not stop_event.is_set():
+                    readable, _, _ = select.select([fd], [], [], 0.05 if stop_event is not None else None)
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    if not readable:
+                        continue
+                    try:
+                        data = os.read(fd, 24 - len(pending))
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        break
+                    pending += data
+                    if len(pending) < 24:
+                        continue
+                    tv_sec, tv_usec, etype, kcode, kvalue = struct.unpack("llHHI", pending)
+                    pending = b""
+                    if kvalue != 0:
+                        if stop_event is not None and stop_event.is_set():
                             return
+                        self.code_name = self.cfg.keymap.get(kcode, str(kcode))
+                        self.value = 1 if kvalue == 1 else -1
+                        LOGGER.debug("Key pressed: %s (code: %s, value: %s)",
+                                     self.code_name, kcode, self.value)
+                        return
             except Exception as e:
                 LOGGER.error("Error reading input: %s", e)
                 self.code_name = ""
                 self.value = 0
+            finally:
+                if fd is not None:
+                    os.close(fd)
 
     def is_key(self, name: str, key_value: int = 99) -> bool:
         if self.code_name == name:
@@ -374,14 +388,24 @@ class UIRenderer:
 
         if self._initialized:
             return
-        self.window = self._create_window()
-        self.renderer = self._create_renderer()
-        self.opt_stretch = True
-        self._initialized = True
+        self.window = None
+        self.renderer = None
+        self._sdl_initialized = False
+        try:
+            if sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO) != 0:
+                raise RuntimeError("Failed to initialize SDL video")
+            self._sdl_initialized = True
+            self.window = self._create_window()
+            self.renderer = self._create_renderer()
+            self.opt_stretch = True
+            self._initialized = True
 
-        self._draw_start()
-        self.screen_reset()
-        self.set_active(self.create_image())
+            self._draw_start()
+            self.screen_reset()
+            self.set_active(self.create_image())
+        except Exception:
+            self.draw_end()
+            raise
 
         self.skip_first_input = True
 
@@ -443,9 +467,16 @@ class UIRenderer:
         return renderer
 
     def draw_end(self) -> None:
-        sdl2.SDL_DestroyRenderer(self.renderer)
-        sdl2.SDL_DestroyWindow(self.window)
-        sdl2.SDL_Quit()
+        if getattr(self, "renderer", None):
+            sdl2.SDL_DestroyRenderer(self.renderer)
+            self.renderer = None
+        if getattr(self, "window", None):
+            sdl2.SDL_DestroyWindow(self.window)
+            self.window = None
+        self._initialized = False
+        if getattr(self, "_sdl_initialized", False):
+            sdl2.SDL_Quit()
+            self._sdl_initialized = False
 
     def create_image(self) -> Image.Image:
         try:
@@ -1019,7 +1050,7 @@ class LauncherApp:
 
         self.t = Translator(self.system_lang)
         self.ui = UIRenderer(self.cfg, self.t, self.hw_info)
-        self.input = InputHandler(self.cfg)
+        self.input = self.ui.input
 
         self.menu_items = [
             {
@@ -1231,32 +1262,47 @@ class LauncherApp:
             self.page_index = page
 
     def launch_application(self, app_key, app_item):
-        self.ui.tips_info(f'{self.t.t("Launching")}: {self.t.t(app_item)}')
-        self.ui.draw_end()
-        self.input = None
-
         script_map = {
             "system_updater": "upgrade.py",
             "software_center": "installer.py"
         }
-
-        script = script_map.get(app_key)
-        script = os.path.join(APP_PATH, script)
-        if not script or not os.path.exists(script):
-            print(f"Error: {script} not found")
-            self.reinit_ui()
+        script_name = script_map.get(app_key)
+        script = os.path.join(APP_PATH, script_name) if script_name else None
+        if not script or not os.path.isfile(script):
+            LOGGER.error("Application script not found: %s", script_name or app_key)
+            self.draw_message_center(self.t.t("Error"), self.t.t("An unexpected error occurred"),
+                                     icon="✘", status="error")
             return
 
+        self._stop_all_threads()
+        if self._active_threads:
+            LOGGER.error("Cannot launch application while an input worker is still running")
+            return
+        self.ui.tips_info(f'{self.t.t("Launching")}: {self.t.t(app_item)}')
+        install_handoff = False
         try:
+            self.ui.draw_end()
+            self.input = None
             result = subprocess.run([sys.executable, script], check=False)
-            if result.returncode != 0:
-                print(f"Subprocess {script} exited with code {result.returncode}")
+            if app_key == "system_updater" and result.returncode == 37:
+                # A verified append update has prepared the wrapper's autostart handoff.
+                install_handoff = True
+            elif result.returncode != 0:
+                LOGGER.error("Subprocess %s exited with code %s", script, result.returncode)
         except Exception as e:
-            print(f"Failed to launch {script}: {e}")
-
-        self.reinit_ui()
+            LOGGER.error("Failed to launch %s: %s", script, e)
+        finally:
+            # Keep menu/configuration state, but never reuse destroyed SDL handles.
+            if not install_handoff:
+                self.reinit_ui()
+        if install_handoff:
+            self.exit_not_cleanup(37)
 
     def reinit_ui(self):
+        self.ui = UIRenderer(self.cfg, self.t, self.hw_info)
+        self.input = self.ui.input
+        self.input.reset()
+        self.skip_first_input = True
         self.cards_per_page = self._calculate_cards_per_page()
         self.total_pages = max(1, (len(self.menu_items) + self.cards_per_page - 1) // self.cards_per_page)
         self.selected_index = min(self.selected_index, len(self.menu_items) - 1)
@@ -1433,8 +1479,11 @@ class LauncherApp:
 
             mode = 'ab' if file_size > 0 else 'wb'
             self._stop_all_threads()
-            self._shutdown_flag = False
-            thread = threading.Thread(target=self._input_poll_worker, name="input_poll")
+            if self._active_threads:
+                raise RuntimeError("Previous input worker is still running")
+            stop_event = threading.Event()
+            thread = threading.Thread(target=self._input_poll_worker, args=(stop_event,), name="input_poll")
+            thread.stop_event = stop_event
             thread.daemon = True
             self._active_threads.append(thread)
             thread.start()
@@ -1494,14 +1543,14 @@ class LauncherApp:
             # 确保线程被停止
             self._stop_all_threads()
 
-    def _input_poll_worker(self):
-        """专门的输入监听工作线程"""
-        while not self._shutdown_flag:
+    def _input_poll_worker(self, stop_event):
+        """Poll with a stop token owned by this worker, never reused by another."""
+        while not stop_event.is_set():
             try:
-                self.input.poll()
-                time.sleep(0.01)  # 小延迟避免过度占用CPU
+                self.input.poll(stop_event)
+                stop_event.wait(0.01)
             except Exception as e:
-                if not self._shutdown_flag:
+                if not stop_event.is_set():
                     LOGGER.error("Error in input poll worker: %s", e)
                 break
 
@@ -1723,18 +1772,17 @@ class LauncherApp:
         time.sleep(0.5)
 
     def _stop_all_threads(self):
-        """停止所有活动线程"""
-        self._shutdown_flag = True
-        time.sleep(0.1)
-
+        for thread in self._active_threads:
+            thread.stop_event.set()
         for thread in self._active_threads[:]:
             if thread.is_alive():
                 thread.join(timeout=0.5)
-                if thread.is_alive():
-                    LOGGER.warning(f"Thread {thread.name} failed to terminate gracefully")
-            self._active_threads.remove(thread)
-
-        self.input.reset()
+            if thread.is_alive():
+                LOGGER.warning("Thread %s failed to terminate gracefully", thread.name)
+            else:
+                self._active_threads.remove(thread)
+        if not self._active_threads and self.input is not None:
+            self.input.reset()
 
     @staticmethod
     def exit_not_cleanup(code: int) -> None:
