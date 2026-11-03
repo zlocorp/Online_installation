@@ -58,6 +58,7 @@
     "Retry saving": "Retry saving",
     "Restart required": "Restart required",
     "The update is installed. Please restart the device manually.": "The update is installed. Please restart the device manually.",
+    "Installation information could not be read. No changes were made.": "Installation information could not be read. No changes were made.",
     "Installation Failed": "Installation Failed",
     "Installed Software": "Installed Software",
     "Installing": "Installing",

@@ -58,6 +58,7 @@
     "Retry saving": "Повторить сохранение",
     "Restart required": "Требуется перезапуск",
     "The update is installed. Please restart the device manually.": "Обновление установлено. Перезапустите устройство вручную.",
+    "Installation information could not be read. No changes were made.": "Не удалось прочитать сведения об установке. Изменения не внесены.",
     "Installation Failed": "Ошибка установки",
     "Installed Software": "Установленное ПО",
     "Installing": "Установка",
